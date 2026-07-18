@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
 from dotenv import dotenv_values
 from fastapi.testclient import TestClient
+from starlette.requests import Request as StarletteRequest
 
 from app.config import Settings
 from app.factory import create_app
@@ -34,6 +37,11 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         "session_cookie_secure": False,
         "login_max_attempts": 5,
         "login_window_seconds": 300,
+        "session_max_age_seconds": 8 * 60 * 60,
+        "max_upload_bytes": 50 * 1024 * 1024,
+        "max_upload_request_bytes": 100 * 1024 * 1024,
+        "max_files_per_upload": 20,
+        "max_public_files": 500,
     }
     values.update(overrides)
     return Settings(**values)
@@ -110,6 +118,11 @@ def test_from_env_rejects_blank_storage_directory(
         "SESSION_COOKIE_SECURE",
         "LOGIN_MAX_ATTEMPTS",
         "LOGIN_WINDOW_SECONDS",
+        "SESSION_MAX_AGE_SECONDS",
+        "MAX_UPLOAD_BYTES",
+        "MAX_UPLOAD_REQUEST_BYTES",
+        "MAX_FILES_PER_UPLOAD",
+        "MAX_PUBLIC_FILES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -133,13 +146,20 @@ def test_public_file_list_and_download(app_client) -> None:
     assert "attachment" in download.headers["content-disposition"]
 
 
-def test_admin_routes_require_login(app_client) -> None:
+def test_admin_routes_require_login(
+    app_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, _ = app_client
 
     dashboard = client.get("/admin", follow_redirects=False)
     assert dashboard.status_code == 303
     assert dashboard.headers["location"].endswith("/admin/login")
 
+    async def fail_if_form_is_parsed(*args, **kwargs):
+        raise AssertionError("anonymous upload must not parse multipart")
+
+    monkeypatch.setattr(StarletteRequest, "form", fail_if_form_is_parsed)
     upload = client.post(
         "/admin/upload",
         data={"csrf_token": "not-valid"},
@@ -148,6 +168,86 @@ def test_admin_routes_require_login(app_client) -> None:
     )
     assert upload.status_code == 303
     assert upload.headers["location"].endswith("/admin/login")
+
+
+def test_anonymous_large_multipart_creates_no_server_temp_file(app_client) -> None:
+    client, _ = app_client
+    multipart_dir = client.app.state.file_store.multipart_dir
+
+    response = client.post(
+        "/admin/upload",
+        data={"csrf_token": "not-valid"},
+        files={
+            "files": (
+                "anonymous.bin",
+                b"x" * (2 * 1024 * 1024),
+                "application/octet-stream",
+            )
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].endswith("/admin/login")
+    assert not list(multipart_dir.iterdir())
+
+
+def test_upload_request_body_limit_rejects_before_multipart_parse(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        max_upload_bytes=1024 * 1024,
+        max_upload_request_bytes=1024 * 1024,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        response = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("too-big.bin", b"x" * (1024 * 1024), "application/octet-stream")},
+        )
+
+    assert response.status_code == 413
+    assert "上传请求过大" in response.text
+    assert not list(app.state.file_store.multipart_dir.iterdir())
+
+
+def test_streamed_upload_without_content_length_is_still_limited(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        max_upload_bytes=1024 * 1024,
+        max_upload_request_bytes=1024 * 1024,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        boundary = "tempserver-boundary"
+        prefix = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="csrf_token"\r\n\r\n'
+            f"{csrf_token}\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="files"; filename="stream.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        suffix = f"\r\n--{boundary}--\r\n".encode()
+
+        response = client.post(
+            "/admin/upload",
+            content=iter([prefix, b"x" * 700_000, b"x" * 700_000, suffix]),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+
+    assert response.status_code == 413
+    assert not list(app.state.file_store.multipart_dir.iterdir())
+
+
+def test_multipart_temp_directory_is_on_storage_drive(app_client) -> None:
+    client, _ = app_client
+    expected = str(client.app.state.file_store.multipart_dir)
+    assert tempfile.gettempdir() == expected
 
 
 def test_invalid_admin_password_is_rejected(app_client) -> None:
@@ -224,6 +324,28 @@ def test_login_attempts_are_rate_limited(app_client) -> None:
     assert int(blocked.headers["retry-after"]) >= 1
 
 
+def test_logout_revokes_replayed_session_cookie(app_client) -> None:
+    client, _ = app_client
+    _login(client)
+    old_cookie = client.cookies.get("tempserver_session")
+    assert old_cookie
+    csrf_token = _csrf(client.get("/admin"))
+
+    logout = client.post(
+        "/admin/logout",
+        data={"csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+    assert logout.status_code == 303
+
+    with TestClient(client.app) as replay_client:
+        replay_client.cookies.set("tempserver_session", old_cookie)
+        replay = replay_client.get("/admin", follow_redirects=False)
+
+    assert replay.status_code == 303
+    assert replay.headers["location"].endswith("/admin/login")
+
+
 def test_admin_can_upload_overwrite_and_delete(app_client) -> None:
     client, _ = app_client
     _login(client)
@@ -255,6 +377,102 @@ def test_admin_can_upload_overwrite_and_delete(app_client) -> None:
     assert deletion.status_code == 303
     assert client.get("/files/release.zip").status_code == 404
     assert "release.zip" not in client.get("/").text
+
+
+def test_duplicate_names_report_upload_items_and_unique_files(app_client) -> None:
+    client, _ = app_client
+    _login(client)
+    csrf_token = _csrf(client.get("/admin"))
+
+    response = client.post(
+        "/admin/upload",
+        data={"csrf_token": csrf_token},
+        files=[
+            ("files", ("dup.txt", b"first", "text/plain")),
+            ("files", ("dup.txt", b"second", "text/plain")),
+        ],
+        follow_redirects=False,
+    )
+    dashboard = client.get(response.headers["location"])
+
+    assert "已处理 2 个上传项，最终涉及 1 个文件" in dashboard.text
+    assert client.get("/files/dup.txt").content == b"second"
+
+
+def test_file_and_batch_limits_have_chinese_admin_feedback(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        max_upload_bytes=1024 * 1024,
+        max_upload_request_bytes=3 * 1024 * 1024,
+        max_files_per_upload=2,
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        too_many = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files=[
+                ("files", ("one.txt", b"", "text/plain")),
+                ("files", ("two.txt", b"", "text/plain")),
+                ("files", ("three.txt", b"", "text/plain")),
+            ],
+            follow_redirects=False,
+        )
+        batch_feedback = client.get(too_many.headers["location"])
+        assert "单次最多 2 个文件" in batch_feedback.text
+
+        csrf_token = _csrf(client.get("/admin"))
+        too_large = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={
+                "files": (
+                    "large.bin",
+                    b"x" * (1024 * 1024 + 1),
+                    "application/octet-stream",
+                )
+            },
+            follow_redirects=False,
+        )
+        size_feedback = client.get(too_large.headers["location"])
+        assert "文件超过单文件大小限制" in size_feedback.text
+
+
+def test_public_file_count_limit_blocks_new_names_but_allows_overwrite(
+    tmp_path: Path,
+) -> None:
+    app = create_app(_settings(tmp_path, max_public_files=2))
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        for name in ("one.txt", "two.txt"):
+            response = client.post(
+                "/admin/upload",
+                data={"csrf_token": csrf_token},
+                files={"files": (name, b"content", "text/plain")},
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+
+        blocked = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("three.txt", b"content", "text/plain")},
+            follow_redirects=False,
+        )
+        blocked_page = client.get(blocked.headers["location"])
+        assert "站点文件数量已达到上限" in blocked_page.text
+
+        overwrite = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("one.txt", b"new", "text/plain")},
+            follow_redirects=False,
+        )
+        assert overwrite.status_code == 303
+        assert client.get("/files/one.txt").content == b"new"
 
 
 def test_version_mapping_and_deletion_persist_across_restart(tmp_path: Path) -> None:
@@ -390,7 +608,7 @@ def test_many_upload_errors_keep_session_cookie_small(app_client) -> None:
             "files",
             (f"{'x' * 180}?{number}.txt", b"x", "text/plain"),
         )
-        for number in range(40)
+        for number in range(20)
     ]
 
     response = client.post(
@@ -403,7 +621,7 @@ def test_many_upload_errors_keep_session_cookie_small(app_client) -> None:
     assert response.status_code == 303
     assert len(response.headers.get("set-cookie", "").encode("utf-8")) < 4096
     dashboard = client.get(response.headers["location"])
-    assert "失败 40 个" in dashboard.text
+    assert "失败 20 个" in dashboard.text
 
 
 def test_secure_cookie_setting_adds_secure_attribute(tmp_path: Path) -> None:
@@ -413,6 +631,58 @@ def test_secure_cookie_setting_adds_secure_attribute(tmp_path: Path) -> None:
         response = client.get("/admin/login")
 
     assert "secure" in response.headers["set-cookie"].casefold()
+
+
+def test_admin_pages_have_no_store_and_security_headers(app_client) -> None:
+    client, _ = app_client
+    login_page = client.get("/admin/login")
+    assert login_page.headers["cache-control"] == "no-store"
+    assert login_page.headers["x-frame-options"] == "DENY"
+    assert login_page.headers["x-content-type-options"] == "nosniff"
+    assert login_page.headers["referrer-policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in login_page.headers["content-security-policy"]
+
+    _login(client)
+    dashboard = client.get("/admin")
+    assert dashboard.headers["cache-control"] == "no-store"
+    assert "onsubmit=" not in dashboard.text
+    assert "/static/admin.js" in dashboard.text
+
+
+def test_storage_directory_disappearance_returns_503(app_client) -> None:
+    client, storage_dir = app_client
+    shutil.rmtree(storage_dir)
+
+    home = client.get("/")
+    health = client.get("/healthz")
+
+    assert home.status_code == 503
+    assert "文件存储目录当前不可用" in home.text
+    assert health.status_code == 503
+    assert health.json() == {"status": "storage_unavailable"}
+
+
+def test_storage_path_that_is_a_file_has_clear_startup_error(tmp_path: Path) -> None:
+    storage_file = tmp_path / "not-a-directory"
+    storage_file.write_text("x", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="FILE_STORAGE_DIR is not a directory"):
+        create_app(_settings(tmp_path, storage_dir=storage_file))
+
+
+def test_sensitive_env_file_in_storage_refuses_startup(tmp_path: Path) -> None:
+    storage_dir = tmp_path / "files"
+    storage_dir.mkdir()
+    (storage_dir / ".env").write_text("SESSION_SECRET=leak", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Sensitive configuration file"):
+        create_app(_settings(tmp_path, storage_dir=storage_dir))
+
+
+def test_application_directory_cannot_be_public_storage(tmp_path: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    with pytest.raises(RuntimeError, match="dedicated directory"):
+        create_app(_settings(tmp_path, storage_dir=repository_root))
 
 
 def test_admin_mutations_require_valid_csrf(app_client) -> None:

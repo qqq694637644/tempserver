@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+MEBIBYTE = 1024 * 1024
 FORBIDDEN_ADMIN_PASSWORDS = {
     "admin123456",
     "change-this-password",
@@ -28,9 +29,14 @@ class Settings:
     admin_password: str
     storage_dir: Path
     session_secret: str
-    session_cookie_secure: bool = False
+    session_cookie_secure: bool = True
+    session_max_age_seconds: int = 8 * 60 * 60
     login_max_attempts: int = 5
     login_window_seconds: int = 300
+    max_upload_bytes: int = 50 * MEBIBYTE
+    max_upload_request_bytes: int = 100 * MEBIBYTE
+    max_files_per_upload: int = 20
+    max_public_files: int = 500
 
     def __post_init__(self) -> None:
         missing = [
@@ -67,10 +73,22 @@ class Settings:
         if len(set(self.session_secret)) < 8:
             raise RuntimeError("SESSION_SECRET is too predictable; generate a random value")
 
+        if not 300 <= self.session_max_age_seconds <= 86400:
+            raise RuntimeError("SESSION_MAX_AGE_SECONDS must be between 300 and 86400")
         if not 1 <= self.login_max_attempts <= 100:
             raise RuntimeError("LOGIN_MAX_ATTEMPTS must be between 1 and 100")
         if not 10 <= self.login_window_seconds <= 86400:
             raise RuntimeError("LOGIN_WINDOW_SECONDS must be between 10 and 86400")
+        if not MEBIBYTE <= self.max_upload_bytes <= 2 * 1024 * MEBIBYTE:
+            raise RuntimeError("MAX_UPLOAD_BYTES must be between 1 MiB and 2 GiB")
+        if not self.max_upload_bytes <= self.max_upload_request_bytes <= 4 * 1024 * MEBIBYTE:
+            raise RuntimeError(
+                "MAX_UPLOAD_REQUEST_BYTES must be at least MAX_UPLOAD_BYTES and at most 4 GiB"
+            )
+        if not 1 <= self.max_files_per_upload <= 100:
+            raise RuntimeError("MAX_FILES_PER_UPLOAD must be between 1 and 100")
+        if not 1 <= self.max_public_files <= 5000:
+            raise RuntimeError("MAX_PUBLIC_FILES must be between 1 and 5000")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -87,7 +105,11 @@ class Settings:
             session_secret=os.getenv("SESSION_SECRET", ""),
             session_cookie_secure=_parse_bool(
                 "SESSION_COOKIE_SECURE",
-                os.getenv("SESSION_COOKIE_SECURE", "false"),
+                os.getenv("SESSION_COOKIE_SECURE", "true"),
+            ),
+            session_max_age_seconds=_parse_int(
+                "SESSION_MAX_AGE_SECONDS",
+                os.getenv("SESSION_MAX_AGE_SECONDS", str(8 * 60 * 60)),
             ),
             login_max_attempts=_parse_int(
                 "LOGIN_MAX_ATTEMPTS",
@@ -96,6 +118,22 @@ class Settings:
             login_window_seconds=_parse_int(
                 "LOGIN_WINDOW_SECONDS",
                 os.getenv("LOGIN_WINDOW_SECONDS", "300"),
+            ),
+            max_upload_bytes=_parse_int(
+                "MAX_UPLOAD_BYTES",
+                os.getenv("MAX_UPLOAD_BYTES", str(50 * MEBIBYTE)),
+            ),
+            max_upload_request_bytes=_parse_int(
+                "MAX_UPLOAD_REQUEST_BYTES",
+                os.getenv("MAX_UPLOAD_REQUEST_BYTES", str(100 * MEBIBYTE)),
+            ),
+            max_files_per_upload=_parse_int(
+                "MAX_FILES_PER_UPLOAD",
+                os.getenv("MAX_FILES_PER_UPLOAD", "20"),
+            ),
+            max_public_files=_parse_int(
+                "MAX_PUBLIC_FILES",
+                os.getenv("MAX_PUBLIC_FILES", "500"),
             ),
         )
 

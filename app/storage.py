@@ -10,10 +10,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import UploadFile
+from starlette.datastructures import UploadFile
 
 
 DATA_DIRECTORY_NAME = ".tempserver-data"
+MULTIPART_DIRECTORY_NAME = "multipart"
 MANIFEST_NAME = ".tempserver-manifest.json"
 MANIFEST_TEMP_PREFIX = ".tempserver-manifest-"
 LEGACY_UPLOAD_TEMP_PREFIX = ".tempserver-upload-"
@@ -31,26 +32,52 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 
+class StorageUnavailableError(RuntimeError):
+    """The configured storage directory is unavailable at runtime."""
+
+
+class UploadTooLargeError(ValueError):
+    """An uploaded file exceeds the configured per-file limit."""
+
+
+class PublicFileLimitError(ValueError):
+    """Adding a new public name would exceed the configured site limit."""
+
+
 class FileStore:
     """Versioned file storage with stable public names.
 
-    Public names are mapped to immutable internal blobs. Replacing or deleting a
-    file only updates the manifest, so an in-progress Windows download can keep
-    its existing file handle while new requests immediately see the new state.
+    Public names map to immutable internal blobs. Replacing or deleting a file
+    only updates the manifest, so an in-progress Windows download can keep its
+    existing file handle while new requests immediately see the new state.
     """
 
-    def __init__(self, storage_dir: Path) -> None:
+    def __init__(self, storage_dir: Path, protected_paths: tuple[Path, ...] = ()) -> None:
         self.storage_dir = storage_dir.expanduser().resolve()
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        if not self.storage_dir.is_dir():
+        self._validate_storage_location(protected_paths)
+
+        if self.storage_dir.exists() and not self.storage_dir.is_dir():
             raise RuntimeError(
                 f"FILE_STORAGE_DIR is not a directory: {self.storage_dir}"
             )
+        try:
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unable to create FILE_STORAGE_DIR: {self.storage_dir}"
+            ) from exc
+
+        self._reject_sensitive_files_at_root()
 
         self.data_dir = self.storage_dir / DATA_DIRECTORY_NAME
-        self.data_dir.mkdir(exist_ok=True)
-        if not self.data_dir.is_dir():
-            raise RuntimeError(f"Internal data path is not a directory: {self.data_dir}")
+        self.multipart_dir = self.data_dir / MULTIPART_DIRECTORY_NAME
+        try:
+            self.data_dir.mkdir(exist_ok=True)
+            self.multipart_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError("Unable to create internal storage directories") from exc
+        if not self.data_dir.is_dir() or not self.multipart_dir.is_dir():
+            raise RuntimeError("Internal storage path is not a directory")
 
         self.manifest_path = self.storage_dir / MANIFEST_NAME
         self._lock = threading.RLock()
@@ -68,48 +95,28 @@ class FileStore:
             raise ValueError("文件名不能以空格或句点结尾")
         if filename.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
             raise ValueError("文件名是 Windows 保留名称")
+        if FileStore._is_sensitive_filename(filename):
+            raise ValueError("该文件名属于敏感配置文件，禁止公开")
         if filename.startswith(
             (LEGACY_UPLOAD_TEMP_PREFIX, MANIFEST_TEMP_PREFIX)
         ) or filename == DATA_DIRECTORY_NAME or filename == MANIFEST_NAME:
             raise ValueError("文件名使用了系统保留名称")
         return filename
 
-    def list_files(self) -> list[dict[str, str]]:
+    def list_files(self, limit: int) -> list[dict[str, str]]:
         with self._lock:
-            files: dict[str, int] = {}
-            mapped = self._manifest["files"]
-            deleted = set(self._manifest["deleted"])
-
-            for name, record in mapped.items():
-                path = self._blob_path(record["blob"])
-                try:
-                    if path.is_symlink() or not path.is_file():
-                        continue
-                    files[name] = path.stat().st_size
-                except OSError:
-                    continue
-
-            for entry in self.storage_dir.iterdir():
-                if self._is_internal_entry(entry.name):
-                    continue
-                if entry.name in mapped or entry.name in deleted:
-                    continue
-                try:
-                    self.validate_filename(entry.name)
-                    if entry.is_symlink() or not entry.is_file():
-                        continue
-                    files[entry.name] = entry.stat().st_size
-                except (OSError, ValueError):
-                    continue
-
+            self._require_available_locked()
+            files = self._visible_files_locked(limit=limit)
+            ordered = sorted(files.items(), key=lambda item: item[0].casefold())
             return [
                 {"name": name, "size": _format_size(size)}
-                for name, size in sorted(files.items(), key=lambda item: item[0].casefold())
+                for name, size in ordered[:limit]
             ]
 
     def resolve_download(self, filename: str) -> Path | None:
         safe_name = self.validate_filename(filename)
         with self._lock:
+            self._require_available_locked()
             if safe_name in self._manifest["deleted"]:
                 return None
 
@@ -126,12 +133,29 @@ class FileStore:
                 return None
             return path
 
-    async def save_upload(self, upload: UploadFile) -> str:
+    def save_upload(
+        self,
+        upload: UploadFile,
+        max_upload_bytes: int,
+        max_public_files: int,
+    ) -> str:
         temporary_path: Path | None = None
         blob_path: Path | None = None
 
         try:
             filename = self.validate_filename(upload.filename or "")
+            if upload.size is not None and upload.size > max_upload_bytes:
+                raise UploadTooLargeError("文件超过单文件大小限制")
+
+            with self._lock:
+                self._require_available_locked()
+                existing_name = self._public_name_exists_locked(filename)
+                visible_count = len(
+                    self._visible_files_locked(limit=max_public_files + 1)
+                )
+                if not existing_name and visible_count >= max_public_files:
+                    raise PublicFileLimitError("站点文件数量已达到上限")
+
             with tempfile.NamedTemporaryFile(
                 mode="wb",
                 prefix=UPLOAD_TEMP_PREFIX,
@@ -139,7 +163,12 @@ class FileStore:
                 delete=False,
             ) as temporary_file:
                 temporary_path = Path(temporary_file.name)
-                while chunk := await upload.read(1024 * 1024):
+                upload.file.seek(0)
+                total = 0
+                while chunk := upload.file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_upload_bytes:
+                        raise UploadTooLargeError("文件超过单文件大小限制")
                     temporary_file.write(chunk)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
@@ -151,6 +180,13 @@ class FileStore:
             size = blob_path.stat().st_size
 
             with self._lock:
+                self._require_available_locked()
+                existing_name = self._public_name_exists_locked(filename)
+                visible_count = len(
+                    self._visible_files_locked(limit=max_public_files + 1)
+                )
+                if not existing_name and visible_count >= max_public_files:
+                    raise PublicFileLimitError("站点文件数量已达到上限")
                 updated = self._copy_manifest_locked()
                 updated["files"][filename] = {"blob": blob_name, "size": size}
                 updated["deleted"] = [
@@ -166,11 +202,11 @@ class FileStore:
                 _unlink_with_retries(temporary_path)
             if blob_path is not None:
                 _unlink_with_retries(blob_path)
-            await upload.close()
 
     def delete(self, filename: str) -> None:
         safe_name = self.validate_filename(filename)
         with self._lock:
+            self._require_available_locked()
             mapped = safe_name in self._manifest["files"]
             legacy_path = self.storage_dir / safe_name
             legacy_exists = False
@@ -188,6 +224,95 @@ class FileStore:
                 updated["deleted"].append(safe_name)
             self._save_manifest_locked(updated)
             self._manifest = updated
+
+    def is_available(self) -> bool:
+        try:
+            with self._lock:
+                self._require_available_locked()
+            return True
+        except StorageUnavailableError:
+            return False
+
+    def _validate_storage_location(self, protected_paths: tuple[Path, ...]) -> None:
+        for protected_path in protected_paths:
+            protected = protected_path.resolve()
+            if protected == self.storage_dir or protected.is_relative_to(
+                self.storage_dir
+            ):
+                raise RuntimeError(
+                    "FILE_STORAGE_DIR must be a dedicated directory and must not "
+                    "contain the application directory"
+                )
+
+    def _reject_sensitive_files_at_root(self) -> None:
+        try:
+            for entry in self.storage_dir.iterdir():
+                if self._is_sensitive_filename(entry.name):
+                    raise RuntimeError(
+                        f"Sensitive configuration file found in FILE_STORAGE_DIR: {entry.name}"
+                    )
+        except OSError as exc:
+            raise RuntimeError("Unable to inspect FILE_STORAGE_DIR") from exc
+
+    def _require_available_locked(self) -> None:
+        try:
+            available = (
+                self.storage_dir.is_dir()
+                and self.data_dir.is_dir()
+                and self.multipart_dir.is_dir()
+            )
+        except OSError as exc:
+            raise StorageUnavailableError("文件存储目录当前不可用") from exc
+        if not available:
+            raise StorageUnavailableError("文件存储目录当前不可用")
+
+    def _public_name_exists_locked(self, filename: str) -> bool:
+        if filename in self._manifest["files"]:
+            return True
+        if filename in self._manifest["deleted"]:
+            return False
+        path = self.storage_dir / filename
+        try:
+            return path.is_file() and not path.is_symlink()
+        except OSError:
+            return False
+
+    def _visible_files_locked(self, limit: int | None = None) -> dict[str, int]:
+        files: dict[str, int] = {}
+        mapped = self._manifest["files"]
+        deleted = set(self._manifest["deleted"])
+
+        for name, record in mapped.items():
+            path = self._blob_path(record["blob"])
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                files[name] = path.stat().st_size
+                if limit is not None and len(files) >= limit:
+                    return files
+            except OSError:
+                continue
+
+        try:
+            entries = self.storage_dir.iterdir()
+            for entry in entries:
+                if self._is_internal_entry(entry.name):
+                    continue
+                if entry.name in mapped or entry.name in deleted:
+                    continue
+                try:
+                    self.validate_filename(entry.name)
+                    if entry.is_symlink() or not entry.is_file():
+                        continue
+                    files[entry.name] = entry.stat().st_size
+                    if limit is not None and len(files) >= limit:
+                        return files
+                except (OSError, ValueError):
+                    continue
+        except OSError as exc:
+            raise StorageUnavailableError("文件存储目录当前不可用") from exc
+
+        return files
 
     def _blob_path(self, blob_name: str) -> Path:
         if (
@@ -296,10 +421,20 @@ class FileStore:
                 _unlink_if_stale(entry, cutoff)
 
         for entry in self.data_dir.iterdir():
+            if entry.name == MULTIPART_DIRECTORY_NAME:
+                continue
             if entry.name.startswith(UPLOAD_TEMP_PREFIX):
                 _unlink_if_stale(entry, cutoff)
             elif entry.name.endswith(BLOB_SUFFIX) and entry.name not in referenced_blobs:
                 _unlink_if_stale(entry, cutoff)
+
+        for entry in self.multipart_dir.iterdir():
+            _unlink_if_stale(entry, cutoff)
+
+    @staticmethod
+    def _is_sensitive_filename(filename: str) -> bool:
+        normalized = filename.casefold()
+        return normalized == ".env" or normalized.startswith(".env.")
 
     @staticmethod
     def _is_internal_entry(filename: str) -> bool:
