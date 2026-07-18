@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}文件管理{% endblock %}
+
+{% block content %}
+<section class="panel">
+    <header class="panel-header admin-header">
+        <div>
+            <p class="eyebrow">ADMIN</p>
+            <h1>文件管理</h1>
+        </div>
+        <div class="header-actions">
+            <a class="secondary-button" href="{{ url_for('home') }}">查看下载页</a>
+            <form method="post" action="{{ url_for('admin_logout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="text-button" type="submit">退出登录</button>
+            </form>
+        </div>
+    </header>
+
+    {% if flash %}
+    <div class="notice {{ flash.kind }}" role="status">{{ flash.message }}</div>
+    {% endif %}
+
+    <form class="upload-box" method="post" action="{{ url_for('upload_files') }}" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="file-picker">
+            <span>选择文件</span>
+            <input name="files" type="file" multiple required>
+        </label>
+        <p>同名文件会直接覆盖。程序不主动限制文件类型、大小或数量。</p>
+        <button class="primary-button" type="submit">上传文件</button>
+    </form>
+
+    <div class="section-heading">
+        <h2>现有文件</h2>
+        <span>{{ files|length }} 个</span>
+    </div>
+
+    {% if files %}
+    <div class="admin-file-list">
+        {% for file in files %}
+        <div class="admin-file-row">
+            <div class="file-details">
+                <span class="file-name">{{ file.name }}</span>
+                <span class="file-size">{{ file.size }}</span>
+            </div>
+            <form method="post" action="{{ url_for('delete_file', filename=file.name) }}" onsubmit="return confirm('确定删除此文件？此操作无法撤销。');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="danger-button" type="submit">删除</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>还没有上传文件</p>
+    </div>
+    {% endif %}
+</section>
+{% endblock %}
+
