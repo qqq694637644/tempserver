@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}文件管理{% endblock %}
+
+{% block content %}
+<section class="panel">
+    <header class="panel-header admin-header">
+        <div>
+            <p class="eyebrow">ADMIN</p>
+            <h1>文件管理</h1>
+        </div>
+        <div class="header-actions">
+            <a class="secondary-button" href="{{ url_for('home') }}">查看下载页</a>
+            <form method="post" action="{{ url_for('admin_logout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="text-button" type="submit">退出登录</button>
+            </form>
+        </div>
+    </header>
+
+    {% if flash %}
+    <div class="notice {{ flash.kind }}" role="status">{{ flash.message }}</div>
+    {% endif %}
+
+    <form
+        class="upload-box"
+        id="upload-form"
+        method="post"
+        action="{{ url_for('upload_files') }}"
+        enctype="multipart/form-data"
+        data-redirect="{{ url_for('admin_dashboard') }}"
+        data-max-file-bytes="{{ max_upload_bytes }}"
+        data-max-files="{{ max_files_per_upload }}"
+    >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="file-picker">
+            <span>选择文件</span>
+            <input name="files" type="file" multiple required>
+        </label>
+        <p>
+            同名文件会直接覆盖。单文件最多 {{ max_upload_mb }} MiB，单次最多
+            {{ max_files_per_upload }} 个文件、{{ max_upload_request_mb }} MiB，站点最多
+            {{ max_public_files }} 个公开文件。
+        </p>
+        <button class="primary-button" type="submit" data-upload-button>上传文件</button>
+        <div class="upload-progress" data-upload-progress hidden>
+            <progress max="100" value="0"></progress>
+            <span data-upload-status>准备上传</span>
+        </div>
+    </form>
+
+    <div class="section-heading">
+        <h2>现有文件</h2>
+        <span>{{ files|length }} 个</span>
+    </div>
+
+    {% if files %}
+    <div class="admin-file-list">
+        {% for file in files %}
+        <div class="admin-file-row">
+            <div class="file-details">
+                <span class="file-name">{{ file.name }}</span>
+                <span class="file-size">{{ file.size }}</span>
+            </div>
+            <form class="delete-form" method="post" action="{{ url_for('delete_file', filename=file.name) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="danger-button" type="submit">删除</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>还没有上传文件</p>
+    </div>
+    {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='admin.js') }}" defer></script>
+{% endblock %}
+

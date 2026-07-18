@@ -1,0 +1,16 @@
+.env
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.tempserver-data/
+.tempserver-manifest.json
+.tempserver-manifest.backup.json
+.tempserver-manifest-*
+.tempserver.lock
+.tempserver-upload-*
+

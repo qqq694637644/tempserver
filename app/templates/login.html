@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}管理员登录{% endblock %}
+
+{% block content %}
+<section class="panel compact-panel">
+    <a class="back-link" href="{{ url_for('home') }}">← 返回文件列表</a>
+    <header class="form-header">
+        <p class="eyebrow">ADMIN</p>
+        <h1>管理员登录</h1>
+    </header>
+
+    {% if error %}
+    <div class="notice error" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <form class="stacked-form" method="post" action="{{ url_for('admin_login_submit') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+            <span>用户名</span>
+            <input name="username" type="text" autocomplete="username" required autofocus>
+        </label>
+        <label>
+            <span>密码</span>
+            <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="primary-button" type="submit">登录</button>
+    </form>
+</section>
+{% endblock %}
+

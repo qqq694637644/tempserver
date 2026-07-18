@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<section class="panel compact-panel">
+    <header class="form-header">
+        <p class="eyebrow">TEMPSERVER</p>
+        <h1>{{ title }}</h1>
+    </header>
+    <div class="notice error" role="alert">{{ message }}</div>
+    <a class="secondary-button" href="{{ url_for('home') }}">重新加载</a>
+</section>
+{% endblock %}
