@@ -9,6 +9,8 @@ htmlcov/
 .vscode/
 .tempserver-data/
 .tempserver-manifest.json
+.tempserver-manifest.backup.json
 .tempserver-manifest-*
+.tempserver.lock
 .tempserver-upload-*
 

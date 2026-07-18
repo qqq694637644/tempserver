@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -8,24 +9,28 @@ import time
 from pathlib import Path
 
 import pytest
+import app.factory as factory_module
 from dotenv import dotenv_values
 from fastapi.testclient import TestClient
 from starlette.requests import Request as StarletteRequest
 
 from app.config import Settings
-from app.factory import create_app
+from app.factory import LoginRateLimiter, create_app
 from app.storage import (
     BLOB_SUFFIX,
     DATA_DIRECTORY_NAME,
+    MANIFEST_BACKUP_NAME,
+    MANIFEST_NAME,
     LEGACY_UPLOAD_TEMP_PREFIX,
     STALE_FILE_MAX_AGE_SECONDS,
     UPLOAD_TEMP_PREFIX,
+    FileStore,
 )
 
 
 CSRF_PATTERN = re.compile(r'name="csrf_token" value="([^"]+)"')
 DEFAULT_PASSWORD = "correct-horse-battery-staple"
-DEFAULT_SECRET = "test-session-secret-with-enough-random-characters-123"
+DEFAULT_SECRET = "N7vP2_xK9qLm4Rz8Tc1Bw5Yh0Ua3Se6DfGkJpVnM2Qr"
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
@@ -37,11 +42,14 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         "session_cookie_secure": False,
         "login_max_attempts": 5,
         "login_window_seconds": 300,
+        "login_max_clients": 10_000,
         "session_max_age_seconds": 8 * 60 * 60,
-        "max_upload_bytes": 50 * 1024 * 1024,
-        "max_upload_request_bytes": 100 * 1024 * 1024,
+        "max_upload_bytes": 100 * 1024 * 1024,
+        "max_upload_request_bytes": 120 * 1024 * 1024,
         "max_files_per_upload": 20,
         "max_public_files": 500,
+        "blob_gc_interval_seconds": 60,
+        "blob_gc_grace_seconds": 60,
     }
     values.update(overrides)
     return Settings(**values)
@@ -106,6 +114,26 @@ def test_known_placeholders_and_weak_password_are_rejected(tmp_path: Path) -> No
         _settings(tmp_path, admin_password="too-short")
 
 
+@pytest.mark.parametrize(
+    "predictable_secret",
+    [
+        "abcdefghabcdefghabcdefghabcdefghabcdefghabc",
+        "1234567812345678123456781234567812345678123",
+    ],
+)
+def test_predictable_session_secrets_are_rejected(
+    tmp_path: Path,
+    predictable_secret: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="token_urlsafe"):
+        _settings(tmp_path, session_secret=predictable_secret)
+
+
+def test_runtime_gc_grace_period_cannot_be_disabled(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="between 30 and 86400"):
+        _settings(tmp_path, blob_gc_grace_seconds=0)
+
+
 def test_from_env_rejects_blank_storage_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -118,11 +146,14 @@ def test_from_env_rejects_blank_storage_directory(
         "SESSION_COOKIE_SECURE",
         "LOGIN_MAX_ATTEMPTS",
         "LOGIN_WINDOW_SECONDS",
+        "LOGIN_MAX_CLIENTS",
         "SESSION_MAX_AGE_SECONDS",
         "MAX_UPLOAD_BYTES",
         "MAX_UPLOAD_REQUEST_BYTES",
         "MAX_FILES_PER_UPLOAD",
         "MAX_PUBLIC_FILES",
+        "BLOB_GC_INTERVAL_SECONDS",
+        "BLOB_GC_GRACE_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -131,8 +162,16 @@ def test_from_env_rejects_blank_storage_directory(
 
 
 def test_public_file_list_and_download(app_client) -> None:
-    client, storage_dir = app_client
-    (storage_dir / "说明.txt").write_bytes("公开内容".encode("utf-8"))
+    client, _ = app_client
+    _login(client)
+    csrf_token = _csrf(client.get("/admin"))
+    upload = client.post(
+        "/admin/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("说明.txt", "公开内容".encode("utf-8"), "text/plain")},
+        follow_redirects=False,
+    )
+    assert upload.status_code == 303
 
     page = client.get("/")
     assert page.status_code == 200
@@ -324,6 +363,22 @@ def test_login_attempts_are_rate_limited(app_client) -> None:
     assert int(blocked.headers["retry-after"]) >= 1
 
 
+def test_login_rate_limiter_has_bounded_ttl_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(factory_module.time, "monotonic", lambda: now[0])
+    limiter = LoginRateLimiter(max_attempts=5, window_seconds=10, max_clients=100)
+
+    for number in range(250):
+        limiter.record_failure(f"203.0.113.{number}")
+    assert limiter.tracked_clients == 100
+
+    now[0] += 20
+    limiter.record_failure("198.51.100.1")
+    assert limiter.tracked_clients == 1
+
+
 def test_logout_revokes_replayed_session_cookie(app_client) -> None:
     client, _ = app_client
     _login(client)
@@ -377,6 +432,60 @@ def test_admin_can_upload_overwrite_and_delete(app_client) -> None:
     assert deletion.status_code == 303
     assert client.get("/files/release.zip").status_code == 404
     assert "release.zip" not in client.get("/").text
+
+
+def test_case_insensitive_unicode_normalized_name_overwrites(app_client) -> None:
+    client, _ = app_client
+    _login(client)
+    csrf_token = _csrf(client.get("/admin"))
+
+    for name, content in (("Report.txt", b"first"), ("report.txt", b"second")):
+        response = client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": (name, content, "text/plain")},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+    page = client.get("/")
+    assert page.text.count(">report.txt<") == 1
+    assert "Report.txt" not in page.text
+    assert client.get("/files/Report.txt").content == b"second"
+    assert client.get("/files/report.txt").content == b"second"
+
+
+def test_head_and_conditional_download_requests(app_client) -> None:
+    client, _ = app_client
+    _login(client)
+    csrf_token = _csrf(client.get("/admin"))
+    content = b"conditional-content"
+    client.post(
+        "/admin/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("probe.bin", content, "application/octet-stream")},
+        follow_redirects=False,
+    )
+
+    get_response = client.get("/files/probe.bin")
+    head_response = client.head("/files/probe.bin")
+    assert get_response.status_code == 200
+    assert head_response.status_code == 200
+    assert head_response.content == b""
+    assert head_response.headers["content-length"] == str(len(content))
+    assert head_response.headers["etag"] == get_response.headers["etag"]
+
+    etag_response = client.get(
+        "/files/probe.bin",
+        headers={"If-None-Match": get_response.headers["etag"]},
+    )
+    modified_response = client.get(
+        "/files/probe.bin",
+        headers={"If-Modified-Since": get_response.headers["last-modified"]},
+    )
+    assert etag_response.status_code == 304
+    assert etag_response.content == b""
+    assert modified_response.status_code == 304
 
 
 def test_duplicate_names_report_upload_items_and_unique_files(app_client) -> None:
@@ -506,14 +615,244 @@ def test_version_mapping_and_deletion_persist_across_restart(tmp_path: Path) -> 
         assert client.get("/files/persistent.bin").status_code == 404
 
 
-def test_open_windows_download_does_not_block_overwrite_or_delete(app_client) -> None:
+def test_primary_manifest_loss_recovers_from_atomic_backup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("critical.txt", b"critical", "text/plain")},
+            follow_redirects=False,
+        )
+
+    manifest = settings.storage_dir / MANIFEST_NAME
+    backup = settings.storage_dir / MANIFEST_BACKUP_NAME
+    assert manifest.exists() and backup.exists()
+    manifest.unlink()
+
+    recovered_app = create_app(settings)
+    with TestClient(recovered_app) as client:
+        assert client.get("/files/critical.txt").content == b"critical"
+    assert manifest.exists()
+
+
+def test_corrupt_primary_manifest_recovers_from_backup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("recover.txt", b"recoverable", "text/plain")},
+            follow_redirects=False,
+        )
+
+    manifest = settings.storage_dir / MANIFEST_NAME
+    manifest.write_text("{not-json", encoding="utf-8")
+
+    recovered_app = create_app(settings)
+    with TestClient(recovered_app) as client:
+        assert client.get("/files/recover.txt").content == b"recoverable"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_newer_backup_generation_wins_over_stale_primary(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    first_app = create_app(settings)
+    with TestClient(first_app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("first.txt", b"first", "text/plain")},
+            follow_redirects=False,
+        )
+    stale_primary = (settings.storage_dir / MANIFEST_NAME).read_bytes()
+
+    second_app = create_app(settings)
+    with TestClient(second_app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("second.txt", b"second", "text/plain")},
+            follow_redirects=False,
+        )
+
+    (settings.storage_dir / MANIFEST_NAME).write_bytes(stale_primary)
+    recovered_app = create_app(settings)
+    with TestClient(recovered_app) as client:
+        assert client.get("/files/first.txt").content == b"first"
+        assert client.get("/files/second.txt").content == b"second"
+
+
+def test_both_manifest_copies_missing_refuses_startup_and_preserves_blobs(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("critical.txt", b"critical", "text/plain")},
+            follow_redirects=False,
+        )
+
+    blobs = list((settings.storage_dir / DATA_DIRECTORY_NAME).glob(f"*{BLOB_SUFFIX}"))
+    assert len(blobs) == 1
+    (settings.storage_dir / MANIFEST_NAME).unlink()
+    (settings.storage_dir / MANIFEST_BACKUP_NAME).unlink()
+
+    with pytest.raises(RuntimeError, match="manifest is missing"):
+        create_app(settings)
+    assert blobs[0].exists()
+
+
+def test_deleted_legacy_file_does_not_reappear_after_primary_manifest_loss(
+    tmp_path: Path,
+) -> None:
+    storage_dir = tmp_path / "files"
+    storage_dir.mkdir()
+    legacy_path = storage_dir / "published.txt"
+    legacy_path.write_bytes(b"old-public-content")
+    settings = _settings(tmp_path, storage_dir=storage_dir)
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/files/published.txt").status_code == 200
+        _login(client)
+        csrf_token = _csrf(client.get("/admin"))
+        client.post(
+            "/admin/files/published.txt/delete",
+            data={"csrf_token": csrf_token},
+            follow_redirects=False,
+        )
+        assert client.get("/files/published.txt").status_code == 404
+
+    legacy_path.write_bytes(b"manually-restored-content")
+    (storage_dir / MANIFEST_NAME).unlink()
+    recovered_app = create_app(settings)
+    with TestClient(recovered_app) as client:
+        assert client.get("/files/published.txt").status_code == 404
+
+
+def test_version_one_manifest_migrates_without_republishing_tombstones(
+    tmp_path: Path,
+) -> None:
+    storage_dir = tmp_path / "files"
+    data_dir = storage_dir / DATA_DIRECTORY_NAME
+    data_dir.mkdir(parents=True)
+    (data_dir / "mapped.blob").write_bytes(b"mapped")
+    (storage_dir / "deleted.txt").write_bytes(b"must-stay-private")
+    (storage_dir / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "files": {
+                    "Mapped.txt": {"blob": "mapped.blob", "size": 6}
+                },
+                "deleted": ["deleted.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = create_app(_settings(tmp_path, storage_dir=storage_dir))
+    with TestClient(app) as client:
+        assert client.get("/files/mapped.txt").content == b"mapped"
+        assert client.get("/files/deleted.txt").status_code == 404
+
+    manifest = json.loads((storage_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
+
+
+def test_storage_directory_allows_only_one_active_instance(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    first_app = create_app(settings)
+    try:
+        with pytest.raises(RuntimeError, match="already in use"):
+            create_app(settings)
+    finally:
+        first_app.state.file_store.close()
+
+    third_app = create_app(settings)
+    third_app.state.file_store.close()
+
+
+def test_runtime_garbage_collection_retries_windows_open_blobs(app_client) -> None:
+    client, _ = app_client
+    _login(client)
+    csrf_token = _csrf(client.get("/admin"))
+    store = client.app.state.file_store
+
+    client.post(
+        "/admin/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("gc.bin", b"version-one", "application/octet-stream")},
+        follow_redirects=False,
+    )
+    first = store.resolve_download("gc.bin")
+    assert first is not None
+
+    with first.path.open("rb") as open_download:
+        client.post(
+            "/admin/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("gc.bin", b"version-two", "application/octet-stream")},
+            follow_redirects=False,
+        )
+        second = store.resolve_download("gc.bin")
+        assert second is not None
+        client.post(
+            "/admin/files/gc.bin/delete",
+            data={"csrf_token": csrf_token},
+            follow_redirects=False,
+        )
+        store.collect_garbage(0)
+        assert open_download.read() == b"version-one"
+        if os.name == "nt":
+            assert first.path.exists()
+        assert not second.path.exists()
+
+    store.collect_garbage(0)
+    assert not first.path.exists()
+
+
+def test_manual_root_files_after_initialization_are_ignored(app_client) -> None:
     client, storage_dir = app_client
-    legacy_path = storage_dir / "busy.bin"
-    legacy_path.write_bytes(b"legacy-version")
+    manual = storage_dir / "manual.txt"
+    manual.write_bytes(b"manual")
+
+    assert "manual.txt" not in client.get("/").text
+    assert client.get("/files/manual.txt").status_code == 404
+
+
+def test_open_windows_download_does_not_block_overwrite_or_delete(app_client) -> None:
+    client, _ = app_client
     _login(client)
     csrf_token = _csrf(client.get("/admin"))
 
-    with legacy_path.open("rb") as legacy_download:
+    initial = client.post(
+        "/admin/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("busy.bin", b"legacy-version", "application/octet-stream")},
+        follow_redirects=False,
+    )
+    assert initial.status_code == 303
+    legacy = client.app.state.file_store.resolve_download("busy.bin")
+    assert legacy is not None
+
+    with legacy.path.open("rb") as legacy_download:
         overwrite = client.post(
             "/admin/upload",
             data={"csrf_token": csrf_token},
@@ -526,7 +865,7 @@ def test_open_windows_download_does_not_block_overwrite_or_delete(app_client) ->
 
         current_path = client.app.state.file_store.resolve_download("busy.bin")
         assert current_path is not None
-        with current_path.open("rb") as current_download:
+        with current_path.path.open("rb") as current_download:
             deletion = client.post(
                 "/admin/files/busy.bin/delete",
                 data={"csrf_token": csrf_token},
@@ -536,7 +875,7 @@ def test_open_windows_download_does_not_block_overwrite_or_delete(app_client) ->
             assert client.get("/files/busy.bin").status_code == 404
             assert current_download.read() == b"new-version"
 
-    assert legacy_path.exists()
+    assert legacy.path.exists()
 
 
 def test_upload_streams_files_larger_than_memory_chunk(app_client) -> None:
@@ -568,35 +907,23 @@ def test_internal_temporary_files_are_hidden(app_client) -> None:
     assert download.status_code == 404
 
 
-def test_stale_temporary_and_orphan_files_are_cleaned_on_startup(
+def test_missing_manifest_with_internal_data_refuses_startup_without_deleting(
     tmp_path: Path,
 ) -> None:
     storage_dir = tmp_path / "files"
     data_dir = storage_dir / DATA_DIRECTORY_NAME
     data_dir.mkdir(parents=True)
 
-    stale_root_temp = storage_dir / f"{LEGACY_UPLOAD_TEMP_PREFIX}stale"
-    stale_upload_temp = data_dir / f"{UPLOAD_TEMP_PREFIX}stale"
     stale_orphan_blob = data_dir / f"orphan{BLOB_SUFFIX}"
-    recent_upload_temp = data_dir / f"{UPLOAD_TEMP_PREFIX}recent"
-    for path in (
-        stale_root_temp,
-        stale_upload_temp,
-        stale_orphan_blob,
-        recent_upload_temp,
-    ):
-        path.write_bytes(b"temporary")
+    stale_orphan_blob.write_bytes(b"temporary")
 
     old_timestamp = time.time() - STALE_FILE_MAX_AGE_SECONDS - 60
-    for path in (stale_root_temp, stale_upload_temp, stale_orphan_blob):
-        os.utime(path, (old_timestamp, old_timestamp))
+    os.utime(stale_orphan_blob, (old_timestamp, old_timestamp))
 
-    create_app(_settings(tmp_path, storage_dir=storage_dir))
+    with pytest.raises(RuntimeError, match="manifest is missing"):
+        create_app(_settings(tmp_path, storage_dir=storage_dir))
 
-    assert not stale_root_temp.exists()
-    assert not stale_upload_temp.exists()
-    assert not stale_orphan_blob.exists()
-    assert recent_upload_temp.exists()
+    assert stale_orphan_blob.exists()
 
 
 def test_many_upload_errors_keep_session_cookie_small(app_client) -> None:
@@ -651,7 +978,7 @@ def test_admin_pages_have_no_store_and_security_headers(app_client) -> None:
 
 def test_storage_directory_disappearance_returns_503(app_client) -> None:
     client, storage_dir = app_client
-    shutil.rmtree(storage_dir)
+    shutil.rmtree(client.app.state.file_store.data_dir)
 
     home = client.get("/")
     health = client.get("/healthz")

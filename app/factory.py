@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import math
 import secrets
 import tempfile
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager, suppress
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
@@ -105,27 +114,52 @@ class RequestBodyLimitMiddleware:
 
 
 class LoginRateLimiter:
-    def __init__(self, max_attempts: int, window_seconds: int) -> None:
+    def __init__(
+        self,
+        max_attempts: int,
+        window_seconds: int,
+        max_clients: int,
+    ) -> None:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
-        self._attempts: dict[str, deque[float]] = defaultdict(deque)
+        self.max_clients = max_clients
+        self._attempts: OrderedDict[str, deque[float]] = OrderedDict()
         self._lock = threading.Lock()
+        self._last_global_prune = time.monotonic()
+
+    @property
+    def tracked_clients(self) -> int:
+        with self._lock:
+            return len(self._attempts)
 
     def retry_after(self, client_key: str) -> int | None:
         now = time.monotonic()
         with self._lock:
-            attempts = self._attempts[client_key]
+            self._prune_global_locked(now)
+            attempts = self._attempts.get(client_key)
+            if attempts is None:
+                return None
             self._prune(attempts, now)
+            if not attempts:
+                self._attempts.pop(client_key, None)
+                return None
+            self._attempts.move_to_end(client_key)
             if len(attempts) < self.max_attempts:
-                if not attempts:
-                    self._attempts.pop(client_key, None)
                 return None
             return max(1, math.ceil(self.window_seconds - (now - attempts[0])))
 
     def record_failure(self, client_key: str) -> None:
         now = time.monotonic()
         with self._lock:
-            attempts = self._attempts[client_key]
+            self._prune_global_locked(now, force=len(self._attempts) >= self.max_clients)
+            attempts = self._attempts.get(client_key)
+            if attempts is None:
+                while len(self._attempts) >= self.max_clients:
+                    self._attempts.popitem(last=False)
+                attempts = deque()
+                self._attempts[client_key] = attempts
+            else:
+                self._attempts.move_to_end(client_key)
             self._prune(attempts, now)
             attempts.append(now)
 
@@ -137,6 +171,18 @@ class LoginRateLimiter:
         cutoff = now - self.window_seconds
         while attempts and attempts[0] <= cutoff:
             attempts.popleft()
+
+    def _prune_global_locked(self, now: float, force: bool = False) -> None:
+        if not force and now - self._last_global_prune < min(60, self.window_seconds):
+            return
+        expired_keys: list[str] = []
+        for client_key, attempts in self._attempts.items():
+            self._prune(attempts, now)
+            if not attempts:
+                expired_keys.append(client_key)
+        for client_key in expired_keys:
+            self._attempts.pop(client_key, None)
+        self._last_global_prune = now
 
 
 class AdminSessionRegistry:
@@ -244,6 +290,32 @@ def _basic_security_headers() -> dict[str, str]:
     }
 
 
+def _etag_matches(if_none_match: str, etag: str) -> bool:
+    normalized_etag = etag.removeprefix("W/")
+    for candidate in if_none_match.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == normalized_etag:
+            return True
+    return False
+
+
+def _is_not_modified(request: Request, etag: str, modified_at: float) -> bool:
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None:
+        return _etag_matches(if_none_match, etag)
+
+    if_modified_since = request.headers.get("if-modified-since")
+    if if_modified_since is None:
+        return False
+    try:
+        parsed = parsedate_to_datetime(if_modified_since)
+        if parsed.tzinfo is None:
+            return False
+        return int(modified_at) <= int(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def create_app(settings: Settings) -> FastAPI:
     file_store = FileStore(
         settings.storage_dir,
@@ -256,18 +328,66 @@ def create_app(settings: Settings) -> FastAPI:
     login_limiter = LoginRateLimiter(
         max_attempts=settings.login_max_attempts,
         window_seconds=settings.login_window_seconds,
+        max_clients=settings.login_max_clients,
     )
     admin_sessions = AdminSessionRegistry(settings.session_max_age_seconds)
+
+    lifecycle_lock = threading.Lock()
+    lifecycle_users = 0
+    garbage_task: asyncio.Task[None] | None = None
+
+    async def garbage_collection_loop() -> None:
+        while True:
+            await asyncio.sleep(settings.blob_gc_interval_seconds)
+            try:
+                await run_in_threadpool(
+                    file_store.collect_garbage,
+                    settings.blob_gc_grace_seconds,
+                )
+            except (OSError, RuntimeError):
+                continue
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        nonlocal lifecycle_users, garbage_task
+        with lifecycle_lock:
+            lifecycle_users += 1
+            first_user = lifecycle_users == 1
+        if first_user:
+            await run_in_threadpool(
+                file_store.collect_garbage,
+                settings.blob_gc_grace_seconds,
+            )
+            garbage_task = asyncio.create_task(garbage_collection_loop())
+        try:
+            yield
+        finally:
+            with lifecycle_lock:
+                lifecycle_users -= 1
+                last_user = lifecycle_users == 0
+            if last_user:
+                if garbage_task is not None:
+                    garbage_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await garbage_task
+                    garbage_task = None
+                file_store.close()
 
     def is_admin(request: Request) -> bool:
         session_id = request.session.get("admin_session_id")
         return isinstance(session_id, str) and admin_sessions.is_active(session_id)
 
-    app = FastAPI(title="tempserver", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="tempserver",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
     app.state.settings = settings
     app.state.storage_dir = file_store.storage_dir
     app.state.file_store = file_store
     app.state.admin_sessions = admin_sessions
+    app.state.login_limiter = login_limiter
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.session_secret,
@@ -345,21 +465,46 @@ def create_app(settings: Settings) -> FastAPI:
             context={"files": files},
         )
 
-    @app.get("/files/{filename}", name="download_file")
-    async def download_file(filename: str):
+    @app.api_route(
+        "/files/{filename}",
+        methods=["GET", "HEAD"],
+        name="download_file",
+    )
+    async def download_file(request: Request, filename: str):
         try:
-            path = await run_in_threadpool(file_store.resolve_download, filename)
+            resolved = await run_in_threadpool(
+                file_store.resolve_download,
+                filename,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="File not found") from exc
         except StorageUnavailableError as exc:
             raise HTTPException(status_code=503, detail="Storage unavailable") from exc
-        if path is None:
+        if resolved is None:
             raise HTTPException(status_code=404, detail="File not found")
-        return FileResponse(
-            path=path,
-            filename=filename,
+        try:
+            stat_result = await run_in_threadpool(resolved.path.stat)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+
+        response = FileResponse(
+            path=resolved.path,
+            filename=resolved.name,
             media_type="application/octet-stream",
+            stat_result=stat_result,
+            headers={"Cache-Control": "public, max-age=0, must-revalidate"},
         )
+        etag = response.headers["etag"]
+        if _is_not_modified(request, etag, stat_result.st_mtime):
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Last-Modified": response.headers["last-modified"],
+                    "Cache-Control": "public, max-age=0, must-revalidate",
+                },
+            )
+        return response
 
     @app.get("/admin/login", name="admin_login")
     async def admin_login(request: Request):
@@ -490,7 +635,7 @@ def create_app(settings: Settings) -> FastAPI:
                             settings.max_upload_bytes,
                             settings.max_public_files,
                         )
-                        unique_names.add(saved_name.casefold())
+                        unique_names.add(FileStore.canonical_name(saved_name))
                         uploaded_count += 1
                     except (OSError, RuntimeError, ValueError) as exc:
                         failed_count += 1

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +11,7 @@ from dotenv import load_dotenv
 
 
 MEBIBYTE = 1024 * 1024
+TOKEN_URLSAFE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 FORBIDDEN_ADMIN_PASSWORDS = {
     "admin123456",
     "change-this-password",
@@ -33,10 +37,13 @@ class Settings:
     session_max_age_seconds: int = 8 * 60 * 60
     login_max_attempts: int = 5
     login_window_seconds: int = 300
-    max_upload_bytes: int = 50 * MEBIBYTE
-    max_upload_request_bytes: int = 100 * MEBIBYTE
+    login_max_clients: int = 10_000
+    max_upload_bytes: int = 100 * MEBIBYTE
+    max_upload_request_bytes: int = 120 * MEBIBYTE
     max_files_per_upload: int = 20
     max_public_files: int = 500
+    blob_gc_interval_seconds: int = 60
+    blob_gc_grace_seconds: int = 60
 
     def __post_init__(self) -> None:
         missing = [
@@ -64,14 +71,14 @@ class Settings:
         if password_normalized == self.admin_username.casefold():
             raise RuntimeError("ADMIN_PASSWORD must not equal ADMIN_USERNAME")
 
-        if len(self.session_secret) < 32:
-            raise RuntimeError("SESSION_SECRET must contain at least 32 characters")
         if self.session_secret.casefold() in {
             secret.casefold() for secret in FORBIDDEN_SESSION_SECRETS
         }:
             raise RuntimeError("SESSION_SECRET must not use an example placeholder")
-        if len(set(self.session_secret)) < 8:
-            raise RuntimeError("SESSION_SECRET is too predictable; generate a random value")
+        if not _looks_generated_session_secret(self.session_secret):
+            raise RuntimeError(
+                "SESSION_SECRET must be generated with secrets.token_urlsafe(32) or stronger"
+            )
 
         if not 300 <= self.session_max_age_seconds <= 86400:
             raise RuntimeError("SESSION_MAX_AGE_SECONDS must be between 300 and 86400")
@@ -79,6 +86,8 @@ class Settings:
             raise RuntimeError("LOGIN_MAX_ATTEMPTS must be between 1 and 100")
         if not 10 <= self.login_window_seconds <= 86400:
             raise RuntimeError("LOGIN_WINDOW_SECONDS must be between 10 and 86400")
+        if not 100 <= self.login_max_clients <= 100_000:
+            raise RuntimeError("LOGIN_MAX_CLIENTS must be between 100 and 100000")
         if not MEBIBYTE <= self.max_upload_bytes <= 2 * 1024 * MEBIBYTE:
             raise RuntimeError("MAX_UPLOAD_BYTES must be between 1 MiB and 2 GiB")
         if not self.max_upload_bytes <= self.max_upload_request_bytes <= 4 * 1024 * MEBIBYTE:
@@ -89,6 +98,10 @@ class Settings:
             raise RuntimeError("MAX_FILES_PER_UPLOAD must be between 1 and 100")
         if not 1 <= self.max_public_files <= 5000:
             raise RuntimeError("MAX_PUBLIC_FILES must be between 1 and 5000")
+        if not 5 <= self.blob_gc_interval_seconds <= 86400:
+            raise RuntimeError("BLOB_GC_INTERVAL_SECONDS must be between 5 and 86400")
+        if not 30 <= self.blob_gc_grace_seconds <= 86400:
+            raise RuntimeError("BLOB_GC_GRACE_SECONDS must be between 30 and 86400")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -119,13 +132,17 @@ class Settings:
                 "LOGIN_WINDOW_SECONDS",
                 os.getenv("LOGIN_WINDOW_SECONDS", "300"),
             ),
+            login_max_clients=_parse_int(
+                "LOGIN_MAX_CLIENTS",
+                os.getenv("LOGIN_MAX_CLIENTS", "10000"),
+            ),
             max_upload_bytes=_parse_int(
                 "MAX_UPLOAD_BYTES",
-                os.getenv("MAX_UPLOAD_BYTES", str(50 * MEBIBYTE)),
+                os.getenv("MAX_UPLOAD_BYTES", str(100 * MEBIBYTE)),
             ),
             max_upload_request_bytes=_parse_int(
                 "MAX_UPLOAD_REQUEST_BYTES",
-                os.getenv("MAX_UPLOAD_REQUEST_BYTES", str(100 * MEBIBYTE)),
+                os.getenv("MAX_UPLOAD_REQUEST_BYTES", str(120 * MEBIBYTE)),
             ),
             max_files_per_upload=_parse_int(
                 "MAX_FILES_PER_UPLOAD",
@@ -135,7 +152,32 @@ class Settings:
                 "MAX_PUBLIC_FILES",
                 os.getenv("MAX_PUBLIC_FILES", "500"),
             ),
+            blob_gc_interval_seconds=_parse_int(
+                "BLOB_GC_INTERVAL_SECONDS",
+                os.getenv("BLOB_GC_INTERVAL_SECONDS", "60"),
+            ),
+            blob_gc_grace_seconds=_parse_int(
+                "BLOB_GC_GRACE_SECONDS",
+                os.getenv("BLOB_GC_GRACE_SECONDS", "60"),
+            ),
         )
+
+
+def _looks_generated_session_secret(value: str) -> bool:
+    if len(value) < 43 or TOKEN_URLSAFE_PATTERN.fullmatch(value) is None:
+        return False
+    counts = Counter(value)
+    entropy = -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in counts.values()
+    )
+    if entropy < 4.5:
+        return False
+    for period in range(1, min(16, len(value) // 2) + 1):
+        repeated = (value[:period] * math.ceil(len(value) / period))[: len(value)]
+        if repeated == value:
+            return False
+    return True
 
 
 def _parse_bool(name: str, value: str) -> bool:

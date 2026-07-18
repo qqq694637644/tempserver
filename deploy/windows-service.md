@@ -72,4 +72,4 @@ nssm start tempserver
 - 将应用上游固定为 `127.0.0.1:8000`；
 - 定期请求 `/healthz`，存储不可用时告警。
 
-不要配置多个 Uvicorn worker，也不要启动多个 tempserver 实例共享同一个 `FILE_STORAGE_DIR`。
+不要配置多个 Uvicorn worker，也不要启动多个 tempserver 实例共享同一个 `FILE_STORAGE_DIR`。程序会对存储目录持有进程级独占锁；第二个实例会明确启动失败，而不是静默覆盖清单。滚动更新时必须先停止旧进程，再启动新进程。

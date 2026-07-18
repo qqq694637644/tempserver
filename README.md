@@ -14,8 +14,8 @@
 
 默认公网限制：
 
-- 单文件最多 50 MiB；
-- 单次请求最多 100 MiB；
+- 单文件最多 100 MiB；
+- 单次请求最多 120 MiB；
 - 单次最多 20 个文件；
 - 站点最多 500 个公开文件。
 
@@ -51,10 +51,13 @@ SESSION_COOKIE_SECURE=true
 SESSION_MAX_AGE_SECONDS=28800
 LOGIN_MAX_ATTEMPTS=5
 LOGIN_WINDOW_SECONDS=300
-MAX_UPLOAD_BYTES=52428800
-MAX_UPLOAD_REQUEST_BYTES=104857600
+LOGIN_MAX_CLIENTS=10000
+MAX_UPLOAD_BYTES=104857600
+MAX_UPLOAD_REQUEST_BYTES=125829120
 MAX_FILES_PER_UPLOAD=20
 MAX_PUBLIC_FILES=500
+BLOB_GC_INTERVAL_SECONDS=60
+BLOB_GC_GRACE_SECONDS=60
 ```
 
 生成会话密钥：
@@ -63,7 +66,7 @@ MAX_PUBLIC_FILES=500
 py -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-不要提交 `.env`。程序会拒绝示例占位值、少于 12 位的管理员密码和明显可预测的会话密钥。
+不要提交 `.env`。程序会拒绝示例占位值、少于 12 位的管理员密码，以及不符合 `secrets.token_urlsafe(32)` 强度和格式的会话密钥。不要手工编写 `SESSION_SECRET`，应始终使用上面的命令生成。
 
 `FILE_STORAGE_DIR` 必须是专用目录，不能设置为项目根目录、`app` 目录或它们的上级目录。若目录根部存在 `.env` 或 `.env.*`，程序会拒绝启动；上传和公开下载同样禁止这些文件名。建议创建一个新的空目录，只让 tempserver 使用。
 
@@ -77,7 +80,34 @@ FILE_STORAGE_DIR/.tempserver-data/multipart
 
 因此不会使用系统盘 `%TEMP%`。上传成功前仍可能同时存在 multipart 临时文件和内部写入临时文件，但占用被 `MAX_UPLOAD_REQUEST_BYTES` 限制。默认最坏情况约为单次请求大小的两倍，另加现有文件版本；请给文件盘预留空间。
 
-上传采用内部唯一版本：已开始的下载继续读取旧版本，新请求立即读取新版本；删除后新请求立即返回 404。超过 24 小时且不再被引用的内部临时文件和旧版本会在启动时清理。
+上传采用内部唯一版本：已开始的下载继续读取旧版本，新请求立即读取新版本；删除后新请求立即返回 404。后台垃圾回收默认每 60 秒运行一次，删除超过 60 秒且不再被清单引用的旧版本。Windows 文件仍被下载句柄占用时，本轮会保留文件，下一轮继续重试。
+
+## 清单、备份与恢复
+
+公开文件名与内部 blob 的映射保存在两份带代次的原子清单中：
+
+```text
+FILE_STORAGE_DIR/.tempserver-manifest.json
+FILE_STORAGE_DIR/.tempserver-manifest.backup.json
+```
+
+启动时会校验两份清单并选择代次较新的有效副本，同时修复另一份副本。主清单丢失或损坏时可以从备份自动恢复。若两份清单都缺失或损坏，而存储目录已经初始化，程序会拒绝启动，并且不会猜测映射或删除无法识别的 blob。
+
+首次使用一个尚未初始化的目录时，目录根部已有的普通文件会迁移到版本存储。迁移完成后，存储目录完全由应用管理：之后手工复制到根目录的文件不会公开，也不会清除已经删除的文件状态。新增和替换文件应始终通过管理页面完成。
+
+维护前必须先停止服务。校验清单并自动修复副本：
+
+```powershell
+python -m app.storage_cli check --storage-dir D:/tempserver-public-files
+```
+
+立即尝试回收所有无引用 blob：
+
+```powershell
+python -m app.storage_cli gc --storage-dir D:/tempserver-public-files --grace-seconds 0
+```
+
+应将两份清单和 `.tempserver-data` 一起纳入备份，不能只备份 blob 文件。
 
 ## 启动与健康检查
 
@@ -99,7 +129,7 @@ GET http://127.0.0.1:8000/healthz
 
 仅在本机使用纯 HTTP 调试管理员登录时，可临时设置 `SESSION_COOKIE_SECURE=false`；公网配置必须改回 `true`。
 
-当前存储清理和服务端会话按单进程设计，请只启动一个 Uvicorn worker。Windows 长期运行方案见 [deploy/windows-service.md](deploy/windows-service.md)。
+当前服务端会话按单进程设计，请只启动一个 Uvicorn worker。存储目录具有进程级独占锁，第二个进程或重叠启动会明确失败，防止清单更新丢失。Windows 长期运行方案见 [deploy/windows-service.md](deploy/windows-service.md)。
 
 ## 管理员会话
 
@@ -107,11 +137,13 @@ GET http://127.0.0.1:8000/healthz
 
 `SESSION_MAX_AGE_SECONDS` 默认 8 小时。若怀疑 `SESSION_SECRET` 泄露，应立即更换密钥并重启服务。
 
-登录失败默认按直接连接 IP 限制为 5 次/300 秒。若前方存在反向代理，应用看到的可能是代理 IP，因此公网反向代理仍应单独对 `/admin/login` 做限流。
+登录失败默认按直接连接 IP 限制为 5 次/300 秒。内存中的 IP 记录使用有容量限制的 TTL 表，默认最多保留 10000 个客户端。若前方存在反向代理，应用看到的可能是代理 IP，因此公网反向代理仍应单独对 `/admin/login` 做限流。
 
 ## 页面规模
 
-页面不提供搜索和分页，因此 `MAX_PUBLIC_FILES` 默认限制为 500。管理员上传新文件达到上限后会被拒绝；同名覆盖不增加数量。手工向存储目录放入超额文件不受上传检查保护，页面只保证按配置上限输出，禁止把该目录当作海量文件仓库。
+页面不提供搜索和分页，因此 `MAX_PUBLIC_FILES` 默认限制为 500。管理员上传新文件达到上限后会被拒绝；大小写不同或 Unicode 规范化后相同的名称视为同一个文件，后上传的版本会覆盖原记录。手工放入存储目录根部的文件不会被公开。
+
+下载端支持 GET、HEAD、Range、ETag 和 `If-None-Match` / `If-Modified-Since` 条件请求，适用于下载管理器、CDN 探测和重复下载缓存校验。
 
 ## 测试
 
