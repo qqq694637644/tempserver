@@ -7,29 +7,39 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+FORBIDDEN_ADMIN_PASSWORDS = {
+    "admin123456",
+    "change-this-password",
+    "changeme12345",
+    "password1234",
+    "请替换为强密码",
+    "请设置至少12位的强密码",
+}
+FORBIDDEN_SESSION_SECRETS = {
+    "replace-with-at-least-32-random-characters",
+    "请替换为至少32位的随机字符串",
+    "请使用下方命令生成随机值",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     admin_username: str
     admin_password: str
     storage_dir: Path
     session_secret: str
+    session_cookie_secure: bool = False
+    login_max_attempts: int = 5
+    login_window_seconds: int = 300
 
-    @classmethod
-    def from_env(cls) -> "Settings":
-        load_dotenv()
-
-        admin_username = os.getenv("ADMIN_USERNAME", "").strip()
-        admin_password = os.getenv("ADMIN_PASSWORD", "")
-        storage_dir = os.getenv("FILE_STORAGE_DIR", "").strip()
-        session_secret = os.getenv("SESSION_SECRET", "")
-
+    def __post_init__(self) -> None:
         missing = [
             name
             for name, value in (
-                ("ADMIN_USERNAME", admin_username),
-                ("ADMIN_PASSWORD", admin_password),
-                ("FILE_STORAGE_DIR", storage_dir),
-                ("SESSION_SECRET", session_secret),
+                ("ADMIN_USERNAME", self.admin_username.strip()),
+                ("ADMIN_PASSWORD", self.admin_password),
+                ("FILE_STORAGE_DIR", str(self.storage_dir).strip()),
+                ("SESSION_SECRET", self.session_secret),
             )
             if not value
         ]
@@ -37,13 +47,70 @@ class Settings:
             raise RuntimeError(
                 "Missing required environment variables: " + ", ".join(missing)
             )
-        if len(session_secret) < 32:
+
+        password_normalized = self.admin_password.casefold()
+        if len(self.admin_password) < 12:
+            raise RuntimeError("ADMIN_PASSWORD must contain at least 12 characters")
+        if password_normalized in {
+            password.casefold() for password in FORBIDDEN_ADMIN_PASSWORDS
+        }:
+            raise RuntimeError("ADMIN_PASSWORD must not use an example placeholder")
+        if password_normalized == self.admin_username.casefold():
+            raise RuntimeError("ADMIN_PASSWORD must not equal ADMIN_USERNAME")
+
+        if len(self.session_secret) < 32:
             raise RuntimeError("SESSION_SECRET must contain at least 32 characters")
+        if self.session_secret.casefold() in {
+            secret.casefold() for secret in FORBIDDEN_SESSION_SECRETS
+        }:
+            raise RuntimeError("SESSION_SECRET must not use an example placeholder")
+        if len(set(self.session_secret)) < 8:
+            raise RuntimeError("SESSION_SECRET is too predictable; generate a random value")
+
+        if not 1 <= self.login_max_attempts <= 100:
+            raise RuntimeError("LOGIN_MAX_ATTEMPTS must be between 1 and 100")
+        if not 10 <= self.login_window_seconds <= 86400:
+            raise RuntimeError("LOGIN_WINDOW_SECONDS must be between 10 and 86400")
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        load_dotenv()
+
+        storage_dir = os.getenv("FILE_STORAGE_DIR", "").strip()
+        if not storage_dir:
+            raise RuntimeError("Missing required environment variables: FILE_STORAGE_DIR")
 
         return cls(
-            admin_username=admin_username,
-            admin_password=admin_password,
-            storage_dir=Path(storage_dir).expanduser(),
-            session_secret=session_secret,
+            admin_username=os.getenv("ADMIN_USERNAME", "").strip(),
+            admin_password=os.getenv("ADMIN_PASSWORD", ""),
+            storage_dir=Path(storage_dir),
+            session_secret=os.getenv("SESSION_SECRET", ""),
+            session_cookie_secure=_parse_bool(
+                "SESSION_COOKIE_SECURE",
+                os.getenv("SESSION_COOKIE_SECURE", "false"),
+            ),
+            login_max_attempts=_parse_int(
+                "LOGIN_MAX_ATTEMPTS",
+                os.getenv("LOGIN_MAX_ATTEMPTS", "5"),
+            ),
+            login_window_seconds=_parse_int(
+                "LOGIN_WINDOW_SECONDS",
+                os.getenv("LOGIN_WINDOW_SECONDS", "300"),
+            ),
         )
 
+
+def _parse_bool(name: str, value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
+
+
+def _parse_int(name: str, value: str) -> int:
+    try:
+        return int(value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc

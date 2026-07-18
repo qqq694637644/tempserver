@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import os
-import re
+import errno
+import math
 import secrets
-import tempfile
+import threading
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Annotated
 
@@ -14,75 +16,51 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import Settings
+from app.storage import FileStore
 
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMPORARY_UPLOAD_PREFIX = ".tempserver-upload-"
-WINDOWS_INVALID_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{number}" for number in range(1, 10)),
-    *(f"LPT{number}" for number in range(1, 10)),
-}
+MAX_FLASH_MESSAGE_LENGTH = 420
+MAX_ERROR_FILENAME_LENGTH = 80
 
 
-def _format_size(size: int) -> str:
-    units = ("B", "KB", "MB", "GB", "TB", "PB")
-    value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(value)} B"
-            return f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{size} B"
+class LoginRateLimiter:
+    def __init__(self, max_attempts: int, window_seconds: int) -> None:
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def retry_after(self, client_key: str) -> int | None:
+        now = time.monotonic()
+        with self._lock:
+            attempts = self._attempts[client_key]
+            self._prune(attempts, now)
+            if len(attempts) < self.max_attempts:
+                if not attempts:
+                    self._attempts.pop(client_key, None)
+                return None
+            return max(1, math.ceil(self.window_seconds - (now - attempts[0])))
+
+    def record_failure(self, client_key: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            attempts = self._attempts[client_key]
+            self._prune(attempts, now)
+            attempts.append(now)
+
+    def reset(self, client_key: str) -> None:
+        with self._lock:
+            self._attempts.pop(client_key, None)
+
+    def _prune(self, attempts: deque[float], now: float) -> None:
+        cutoff = now - self.window_seconds
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
 
 
-def _validate_filename(filename: str) -> str:
-    if filename in {"", ".", ".."}:
-        raise ValueError("文件名不能为空")
-    if WINDOWS_INVALID_CHARACTERS.search(filename):
-        raise ValueError("文件名包含 Windows 不支持的字符")
-    if filename.endswith((" ", ".")):
-        raise ValueError("文件名不能以空格或句点结尾")
-    if filename.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
-        raise ValueError("文件名是 Windows 保留名称")
-    if filename.startswith(TEMPORARY_UPLOAD_PREFIX):
-        raise ValueError("文件名使用了系统保留前缀")
-    return filename
-
-
-def _direct_file(storage_dir: Path, filename: str) -> Path:
-    safe_name = _validate_filename(filename)
-    candidate = storage_dir / safe_name
-    if candidate.parent.resolve() != storage_dir.resolve():
-        raise ValueError("非法文件路径")
-    return candidate
-
-
-def _list_files(storage_dir: Path) -> list[dict[str, str]]:
-    files: list[dict[str, str]] = []
-    for entry in storage_dir.iterdir():
-        try:
-            if (
-                entry.name.startswith(TEMPORARY_UPLOAD_PREFIX)
-                or entry.is_symlink()
-                or not entry.is_file()
-            ):
-                continue
-            size = entry.stat().st_size
-        except OSError:
-            continue
-        files.append(
-            {
-                "name": entry.name,
-                "size": _format_size(size),
-            }
-        )
-    return sorted(files, key=lambda item: item["name"].casefold())
+def _constant_time_equal(left: str, right: str) -> bool:
+    return secrets.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 def _csrf_token(request: Request) -> str:
@@ -98,7 +76,7 @@ def _valid_csrf(request: Request, submitted_token: str) -> bool:
     return (
         isinstance(stored_token, str)
         and bool(stored_token)
-        and secrets.compare_digest(stored_token, submitted_token)
+        and _constant_time_equal(stored_token, submitted_token)
     )
 
 
@@ -110,49 +88,54 @@ def _login_redirect(request: Request) -> RedirectResponse:
     return RedirectResponse(request.url_for("admin_login"), status_code=303)
 
 
-async def _save_upload(storage_dir: Path, upload: UploadFile) -> str:
-    temporary_path: Path | None = None
+def _client_key(request: Request) -> str:
+    if request.client is None:
+        return "unknown"
+    return request.client.host
 
-    try:
-        filename = _validate_filename(upload.filename or "")
-        target = _direct_file(storage_dir, filename)
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=TEMPORARY_UPLOAD_PREFIX,
-            dir=storage_dir,
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            while chunk := await upload.read(1024 * 1024):
-                temporary_file.write(chunk)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
 
-        os.replace(temporary_path, target)
-        temporary_path = None
-        return filename
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        await upload.close()
+def _set_flash(request: Request, kind: str, message: str) -> None:
+    request.session["flash"] = {
+        "kind": kind,
+        "message": message[:MAX_FLASH_MESSAGE_LENGTH],
+    }
+
+
+def _short_filename(filename: str | None) -> str:
+    value = filename or "未命名文件"
+    if len(value) <= MAX_ERROR_FILENAME_LENGTH:
+        return value
+    return value[: MAX_ERROR_FILENAME_LENGTH - 1] + "…"
+
+
+def _friendly_storage_error(exc: Exception) -> str:
+    if isinstance(exc, PermissionError):
+        return "存储目录暂时被占用或没有写入权限，请稍后重试"
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return "磁盘空间不足"
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return "存储操作失败，请稍后重试"
 
 
 def create_app(settings: Settings) -> FastAPI:
-    storage_dir = settings.storage_dir.resolve()
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    if not storage_dir.is_dir():
-        raise RuntimeError(f"FILE_STORAGE_DIR is not a directory: {storage_dir}")
+    file_store = FileStore(settings.storage_dir)
+    login_limiter = LoginRateLimiter(
+        max_attempts=settings.login_max_attempts,
+        window_seconds=settings.login_window_seconds,
+    )
 
     app = FastAPI(title="tempserver", docs_url=None, redoc_url=None)
     app.state.settings = settings
-    app.state.storage_dir = storage_dir
+    app.state.storage_dir = file_store.storage_dir
+    app.state.file_store = file_store
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.session_secret,
         session_cookie="tempserver_session",
         max_age=8 * 60 * 60,
         same_site="lax",
-        https_only=False,
+        https_only=settings.session_cookie_secure,
     )
     app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
     templates = Jinja2Templates(directory=BASE_DIR / "templates")
@@ -162,16 +145,16 @@ def create_app(settings: Settings) -> FastAPI:
         return templates.TemplateResponse(
             request=request,
             name="index.html",
-            context={"files": _list_files(storage_dir)},
+            context={"files": file_store.list_files()},
         )
 
     @app.get("/files/{filename}", name="download_file")
     async def download_file(filename: str):
         try:
-            path = _direct_file(storage_dir, filename)
+            path = file_store.resolve_download(filename)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="File not found") from exc
-        if path.is_symlink() or not path.is_file():
+        if path is None:
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(
             path=path,
@@ -199,9 +182,24 @@ def create_app(settings: Settings) -> FastAPI:
         if not _valid_csrf(request, csrf_token):
             raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
-        username_matches = secrets.compare_digest(username, settings.admin_username)
-        password_matches = secrets.compare_digest(password, settings.admin_password)
+        client_key = _client_key(request)
+        retry_after = login_limiter.retry_after(client_key)
+        if retry_after is not None:
+            return templates.TemplateResponse(
+                request=request,
+                name="login.html",
+                context={
+                    "csrf_token": _csrf_token(request),
+                    "error": f"登录尝试过多，请在 {retry_after} 秒后重试",
+                },
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        username_matches = _constant_time_equal(username, settings.admin_username)
+        password_matches = _constant_time_equal(password, settings.admin_password)
         if not (username_matches and password_matches):
+            login_limiter.record_failure(client_key)
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
@@ -212,6 +210,7 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=401,
             )
 
+        login_limiter.reset(client_key)
         request.session.clear()
         request.session["is_admin"] = True
         request.session["csrf_token"] = secrets.token_urlsafe(32)
@@ -226,7 +225,7 @@ def create_app(settings: Settings) -> FastAPI:
             request=request,
             name="admin.html",
             context={
-                "files": _list_files(storage_dir),
+                "files": file_store.list_files(),
                 "csrf_token": _csrf_token(request),
                 "flash": flash,
             },
@@ -243,25 +242,28 @@ def create_app(settings: Settings) -> FastAPI:
         if not _valid_csrf(request, csrf_token):
             raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
-        uploaded: list[str] = []
-        errors: list[str] = []
+        uploaded_count = 0
+        failed_count = 0
+        first_error: str | None = None
         for upload in files:
             try:
-                uploaded.append(await _save_upload(storage_dir, upload))
-            except (OSError, ValueError) as exc:
-                errors.append(f"{upload.filename or '未命名文件'}：{exc}")
+                await file_store.save_upload(upload)
+                uploaded_count += 1
+            except (OSError, RuntimeError, ValueError) as exc:
+                failed_count += 1
+                if first_error is None:
+                    first_error = (
+                        f"{_short_filename(upload.filename)}："
+                        f"{_friendly_storage_error(exc)}"
+                    )
 
-        if errors:
-            prefix = f"已上传 {len(uploaded)} 个文件；" if uploaded else ""
-            request.session["flash"] = {
-                "kind": "error",
-                "message": prefix + "上传失败：" + "；".join(errors),
-            }
+        if failed_count:
+            message = f"成功 {uploaded_count} 个，失败 {failed_count} 个"
+            if first_error:
+                message += f"。首个错误：{first_error}"
+            _set_flash(request, "error", message)
         else:
-            request.session["flash"] = {
-                "kind": "success",
-                "message": f"已上传或覆盖 {len(uploaded)} 个文件",
-            }
+            _set_flash(request, "success", f"已上传或覆盖 {uploaded_count} 个文件")
         return RedirectResponse(request.url_for("admin_dashboard"), status_code=303)
 
     @app.post("/admin/files/{filename}/delete", name="delete_file")
@@ -276,19 +278,12 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
         try:
-            path = _direct_file(storage_dir, filename)
-            if path.is_symlink() or not path.is_file():
-                raise FileNotFoundError(filename)
-            path.unlink()
-            request.session["flash"] = {
-                "kind": "success",
-                "message": f"已删除 {filename}",
-            }
-        except (OSError, ValueError) as exc:
-            request.session["flash"] = {
-                "kind": "error",
-                "message": f"删除 {filename} 失败：{exc}",
-            }
+            file_store.delete(filename)
+            _set_flash(request, "success", f"已删除 {_short_filename(filename)}")
+        except FileNotFoundError:
+            _set_flash(request, "error", "文件不存在或已经删除")
+        except (OSError, RuntimeError, ValueError) as exc:
+            _set_flash(request, "error", _friendly_storage_error(exc))
         return RedirectResponse(request.url_for("admin_dashboard"), status_code=303)
 
     @app.post("/admin/logout", name="admin_logout")
@@ -302,4 +297,3 @@ def create_app(settings: Settings) -> FastAPI:
         return RedirectResponse(request.url_for("home"), status_code=303)
 
     return app
-
